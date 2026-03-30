@@ -1,184 +1,295 @@
-from pathlib import Path
+from __future__ import annotations
+
 from math import isfinite
+from pathlib import Path
 import os
+from typing import Any
 
 import joblib
 import pandas as pd
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+
+FEATURES = ["food", "transport", "shopping"]
+
+
+class APIError(Exception):
+    def __init__(self, message: str, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+class ModelState:
+    def __init__(
+        self,
+        model: Any | None,
+        metadata: dict[str, Any],
+        model_path: Path | None,
+        load_error: str | None,
+    ) -> None:
+        self.model = model
+        self.metadata = metadata
+        self.model_path = model_path
+        self.load_error = load_error
+
+
+class ModelManager:
+    def __init__(self) -> None:
+        self.candidate_paths = [
+            Path(os.getenv("MODEL_PATH", "")).expanduser() if os.getenv("MODEL_PATH") else None,
+            Path(__file__).resolve().parent / "expense_model.pkl",
+            Path(__file__).resolve().parents[1] / "ml-model" / "expense_model.pkl",
+        ]
+        self.state = self._load_state()
+
+    def _load_state(self) -> ModelState:
+        try:
+            candidates = [p for p in self.candidate_paths if p and p.exists()]
+            if not candidates:
+                searched = ", ".join(str(p) for p in self.candidate_paths if p)
+                return ModelState(None, {}, None, f"Model file not found. Searched: {searched}")
+
+            model_path = max(candidates, key=lambda p: p.stat().st_mtime)
+            loaded = joblib.load(model_path)
+
+            if isinstance(loaded, dict) and "model" in loaded:
+                metadata = loaded.get("metadata") or {}
+                return ModelState(loaded["model"], metadata, model_path, None)
+
+            return ModelState(loaded, {}, model_path, None)
+        except Exception as exc:
+            return ModelState(None, {}, None, f"Failed to load model: {str(exc)}")
+
+    def ensure_available(self) -> None:
+        if self.state.model is None:
+            raise APIError(self.state.load_error or "Model unavailable", 503)
+
+
+class InputValidator:
+    @staticmethod
+    def parse_payload(payload: Any) -> dict[str, float]:
+        if not isinstance(payload, dict):
+            raise APIError("Request body must be a valid JSON object", 400)
+
+        parsed: dict[str, float] = {}
+        for field in FEATURES:
+            if field not in payload:
+                raise APIError(f"Missing required field: {field}", 400)
+
+            parsed[field] = InputValidator._parse_number(payload[field], field)
+
+        budget_value = payload.get("budget")
+        if budget_value is not None:
+            parsed["budget"] = InputValidator._parse_number(budget_value, "budget")
+
+        return parsed
+
+    @staticmethod
+    def _parse_number(value: Any, field_name: str) -> float:
+        if value is None:
+            raise APIError(f"{field_name} cannot be null", 400)
+
+        try:
+            if isinstance(value, str):
+                cleaned = value.strip().replace(",", "").replace("₹", "").replace("$", "")
+            else:
+                cleaned = value
+            parsed = float(cleaned)
+        except (TypeError, ValueError):
+            raise APIError(f"{field_name} must be a numeric value", 400)
+
+        if not isfinite(parsed):
+            raise APIError(f"{field_name} must be a finite number", 400)
+        if parsed < 0:
+            raise APIError(f"{field_name} must be non-negative", 400)
+
+        return parsed
+
+
+class PredictionEngine:
+    def __init__(self, model_state: ModelState) -> None:
+        self.model_state = model_state
+        self.metadata = model_state.metadata if isinstance(model_state.metadata, dict) else {}
+
+    def predict(self, inputs: dict[str, float]) -> dict[str, Any]:
+        food = inputs["food"]
+        transport = inputs["transport"]
+        shopping = inputs["shopping"]
+        budget = inputs.get("budget")
+
+        actual_total = food + transport + shopping
+        ml_prediction = self._predict_ml(food, transport, shopping)
+        final_prediction = self._hybrid_prediction(ml_prediction, actual_total)
+        confidence_score = self._confidence_score(ml_prediction, actual_total, food, transport, shopping)
+        confidence = self._confidence_label(confidence_score)
+        expense_status = self._expense_status(final_prediction, budget)
+        suggestion = self._suggestion(food, transport, shopping, budget, final_prediction)
+        breakdown = self._breakdown(food, transport, shopping, actual_total)
+
+        return {
+            "status": "success",
+            "predicted_expense": round(final_prediction, 2),
+            "actual_input_total": round(actual_total, 2),
+            "ml_prediction": round(ml_prediction, 2),
+            "confidence": confidence,
+            "confidence_score": round(confidence_score, 3),
+            "expense_status": expense_status,
+            "suggestion": suggestion,
+            "breakdown": breakdown,
+        }
+
+    def _predict_ml(self, food: float, transport: float, shopping: float) -> float:
+        model = self.model_state.model
+        if model is None:
+            raise APIError("Model unavailable", 503)
+
+        try:
+            features = self.metadata.get("features", FEATURES)
+            row = {
+                "food": food,
+                "transport": transport,
+                "shopping": shopping,
+            }
+            model_input = pd.DataFrame([[row.get(name, 0.0) for name in features]], columns=features)
+            predicted = float(model.predict(model_input)[0])
+            return max(0.0, predicted)
+        except APIError:
+            raise
+        except Exception as exc:
+            raise APIError(f"Model prediction failed: {str(exc)}", 500)
+
+    @staticmethod
+    def _hybrid_prediction(ml_prediction: float, actual_total: float) -> float:
+        if actual_total <= 0:
+            return max(0.0, ml_prediction)
+
+        divergence_ratio = abs(ml_prediction - actual_total) / max(actual_total, 1.0)
+        ml_weight = max(0.2, min(0.8, 0.8 - 0.5 * divergence_ratio))
+        logic_weight = 1.0 - ml_weight
+        final = ml_weight * ml_prediction + logic_weight * actual_total
+        return max(0.0, final)
+
+    @staticmethod
+    def _confidence_score(ml_prediction: float, actual_total: float, food: float, transport: float, shopping: float) -> float:
+        if actual_total <= 0:
+            agreement_score = 1.0
+        else:
+            ratio = abs(ml_prediction - actual_total) / max(actual_total, 1.0)
+            agreement_score = max(0.0, min(1.0, 1.0 / (1.0 + ratio)))
+
+        values = [food, transport, shopping]
+        mean_value = sum(values) / len(values)
+        if mean_value <= 0:
+            stability_score = 1.0
+        else:
+            variance = sum((v - mean_value) ** 2 for v in values) / len(values)
+            std_dev = variance ** 0.5
+            coeff_var = std_dev / mean_value
+            stability_score = max(0.0, min(1.0, 1.0 / (1.0 + coeff_var)))
+
+        score = 0.7 * agreement_score + 0.3 * stability_score
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _confidence_label(score: float) -> str:
+        if score >= 0.8:
+            return "high"
+        if score >= 0.6:
+            return "medium"
+        return "low"
+
+    @staticmethod
+    def _expense_status(predicted_expense: float, budget: float | None) -> str:
+        if budget is not None:
+            if budget <= 0:
+                return "High"
+            utilization = predicted_expense / budget
+            if utilization <= 0.8:
+                return "Low"
+            if utilization <= 1.0:
+                return "Moderate"
+            return "High"
+
+        if predicted_expense <= 3000:
+            return "Low"
+        if predicted_expense <= 12000:
+            return "Moderate"
+        return "High"
+
+    @staticmethod
+    def _suggestion(food: float, transport: float, shopping: float, budget: float | None, predicted_expense: float) -> str:
+        buckets = {
+            "food": food,
+            "transport": transport,
+            "shopping": shopping,
+        }
+        highest_category = max(buckets, key=buckets.get)
+
+        if budget is not None and budget > 0 and predicted_expense > budget:
+            if highest_category == "shopping":
+                return "Predicted spending exceeds budget. Reduce shopping expenses first."
+            if highest_category == "food":
+                return "Predicted spending exceeds budget. Control food expenses and meal planning."
+            return "Predicted spending exceeds budget. Optimize transport costs where possible."
+
+        if highest_category == "shopping":
+            return "Shopping is your largest expense component. Consider setting a shopping cap."
+        if highest_category == "food":
+            return "Food spending is dominant. Plan meals weekly to control costs."
+        return "Transport has a strong share. Consider optimizing commute and travel frequency."
+
+    @staticmethod
+    def _breakdown(food: float, transport: float, shopping: float, total: float) -> dict[str, float]:
+        if total <= 0:
+            return {
+                "food_percent": 0.0,
+                "transport_percent": 0.0,
+                "shopping_percent": 0.0,
+            }
+
+        return {
+            "food_percent": round((food / total) * 100.0, 2),
+            "transport_percent": round((transport / total) * 100.0, 2),
+            "shopping_percent": round((shopping / total) * 100.0, 2),
+        }
+
+
 app = Flask(__name__)
 CORS(app)
-
-DEFAULT_FEATURES = ["food", "transport", "shopping"]
-
-DEFAULT_FEATURE_RANGES = {
-    "food": (100.0, 1000.0),
-    "transport": (50.0, 800.0),
-    "shopping": (100.0, 5000.0),
-}
-
-MODEL_CANDIDATE_PATHS = [
-    Path(os.getenv("MODEL_PATH", "")).expanduser() if os.getenv("MODEL_PATH") else None,
-    Path(__file__).resolve().parent / "expense_model.pkl",
-    Path(__file__).resolve().parents[1] / "finance-api" / "expense_model.pkl",
-]
-
-
-def load_model():
-    existing_candidates = [path for path in MODEL_CANDIDATE_PATHS if path and path.exists()]
-    if existing_candidates:
-        model_path = max(existing_candidates, key=lambda p: p.stat().st_mtime)
-        loaded = joblib.load(model_path)
-
-        if isinstance(loaded, dict) and "model" in loaded:
-            return loaded["model"], loaded.get("metadata") or {}, model_path
-
-        return loaded, {}, model_path
-
-    searched_paths = ", ".join(str(path) for path in MODEL_CANDIDATE_PATHS if path)
-    raise FileNotFoundError(f"Model file not found. Searched: {searched_paths}")
-
-
-model, model_metadata, model_path = load_model()
-FEATURES = model_metadata.get("features", DEFAULT_FEATURES)
-
-
-def parse_feature(data: dict, field_name: str) -> float:
-    if field_name not in data:
-        raise KeyError(field_name)
-
-    value = data[field_name]
-
-    if value is None:
-        raise ValueError(f"{field_name} cannot be null")
-
-    try:
-        parsed_value = float(str(value).replace(",", "").replace("₹", ""))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be a number") from exc
-
-    if not isfinite(parsed_value) or parsed_value < 0:
-        raise ValueError(f"{field_name} must be greater than or equal to 0")
-
-    return parsed_value
-
-
-def get_feature_ranges():
-    metadata_ranges = model_metadata.get("feature_ranges") if isinstance(model_metadata, dict) else None
-
-    if isinstance(metadata_ranges, dict):
-        merged = {}
-        for feature in FEATURES:
-            low_high = metadata_ranges.get(feature)
-            if (
-                isinstance(low_high, (list, tuple))
-                and len(low_high) == 2
-                and isinstance(low_high[0], (int, float))
-                and isinstance(low_high[1], (int, float))
-            ):
-                merged[feature] = (float(low_high[0]), float(low_high[1]))
-            else:
-                merged[feature] = DEFAULT_FEATURE_RANGES.get(feature, (0.0, float("inf")))
-        return merged
-
-    return {feature: DEFAULT_FEATURE_RANGES.get(feature, (0.0, float("inf"))) for feature in FEATURES}
-
-
-def clamp(value, low, high):
-    return min(max(value, low), high)
-
-
-def get_model_quality():
-    metrics = model_metadata.get("metrics", {}) if isinstance(model_metadata, dict) else {}
-    r2 = metrics.get("r2", model_metadata.get("r2")) if isinstance(metrics, dict) else model_metadata.get("r2")
-
-    if isinstance(r2, (int, float)):
-        return max(0.0, min(1.0, float(r2)))
-
-    return 0.75
-
-
-def get_stability(adjustments, total):
-    if total <= 0:
-        return 0.5
-    return max(0.0, 1 - (adjustments / total))
-
-
-def confidence_label(score):
-    if score >= 0.85:
-        return "high"
-    if score >= 0.65:
-        return "medium"
-    return "low"
+model_manager = ModelManager()
 
 
 @app.get("/")
-def health():
+def health() -> Any:
+    state = model_manager.state
     return jsonify(
         {
-            "message": "API running",
-            "model": str(model_path.name),
-            "features": FEATURES,
-            "model_name": model_metadata.get("model_name", type(model).__name__),
-            "model_metrics": model_metadata.get("metrics", {}),
+            "message": "Finance expense prediction API is running",
+            "model_loaded": state.model is not None,
+            "model_file": state.model_path.name if state.model_path else None,
+            "features": state.metadata.get("features", FEATURES),
+            "model_name": state.metadata.get("model_name") if isinstance(state.metadata, dict) else None,
+            "load_error": state.load_error,
         }
     )
 
 
 @app.post("/predict")
-def predict():
+def predict() -> Any:
     try:
-        data = request.get_json(silent=True)
-
-        if not isinstance(data, dict):
-            return jsonify({"status": "error", "message": "Invalid JSON"}), 400
-
-        inputs = {f: parse_feature(data, f) for f in FEATURES}
-        ranges = get_feature_ranges()
-
-        adjusted = {}
-        adjustments = []
-
-        for f in FEATURES:
-            raw = inputs[f]
-            low, high = ranges[f]
-            clipped = clamp(raw, low, high)
-            adjusted[f] = clipped
-
-            if raw != clipped:
-                adjustments.append(f)
-
-        model_input = pd.DataFrame([adjusted], columns=FEATURES)
-        prediction = float(model.predict(model_input)[0])
-        prediction = max(0.0, min(prediction, 100000.0))
-
-        model_q = get_model_quality()
-        stability = get_stability(len(adjustments), len(FEATURES))
-
-        confidence_score = round(max(0.0, min(1.0, 0.6 * model_q + 0.4 * stability)), 3)
-        confidence = confidence_label(confidence_score)
-
-        return jsonify(
-            {
-                "status": "success",
-                "predicted_expense": round(prediction, 2),
-                "confidence": confidence,
-                "confidence_score": confidence_score,
-                "note": "Inputs adjusted" if adjustments else "Inputs normal",
-            }
-        )
-
-    except KeyError as e:
-        return jsonify({"status": "error", "message": f"Missing: {e.args[0]}"}), 400
-
-    except ValueError as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-
+        model_manager.ensure_available()
+        payload = request.get_json(silent=True)
+        inputs = InputValidator.parse_payload(payload)
+        engine = PredictionEngine(model_manager.state)
+        result = engine.predict(inputs)
+        return jsonify(result), 200
+    except APIError as exc:
+        return jsonify({"status": "error", "message": exc.message}), exc.status_code
     except Exception:
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
