@@ -121,18 +121,24 @@ class PredictionEngine:
 
         actual_total = food + transport + shopping
         ml_prediction = self._predict_ml(food, transport, shopping)
-        final_prediction = self._hybrid_prediction(ml_prediction, actual_total)
-        confidence_score = self._confidence_score(ml_prediction, actual_total, food, transport, shopping)
-        confidence = self._confidence_label(confidence_score)
+        final_prediction = 0.6 * ml_prediction + 0.4 * actual_total
+        final_prediction = max(0.0, final_prediction)
+        
+        variance = abs(ml_prediction - actual_total) / max(actual_total, 1.0)
+        confidence_score = self._compute_confidence(variance)
+        confidence = self._confidence_label(variance)
+        
         expense_status = self._expense_status(final_prediction, budget)
-        suggestion = self._suggestion(food, transport, shopping, budget, final_prediction)
-        breakdown = self._breakdown(food, transport, shopping, actual_total)
+        remaining_budget = None if budget is None else max(0.0, budget - final_prediction)
+        suggestion = self._suggestion(food, transport, shopping)
+        breakdown = self._breakdown(food, transport, shopping)
 
         return {
             "status": "success",
             "predicted_expense": round(final_prediction, 2),
-            "actual_input_total": round(actual_total, 2),
+            "actual_total": round(actual_total, 2),
             "ml_prediction": round(ml_prediction, 2),
+            "remaining_budget": round(remaining_budget, 2) if remaining_budget is not None else None,
             "confidence": confidence,
             "confidence_score": round(confidence_score, 3),
             "expense_status": expense_status,
@@ -161,98 +167,65 @@ class PredictionEngine:
             raise APIError(f"Model prediction failed: {str(exc)}", 500)
 
     @staticmethod
-    def _hybrid_prediction(ml_prediction: float, actual_total: float) -> float:
-        if actual_total <= 0:
-            return max(0.0, ml_prediction)
-
-        divergence_ratio = abs(ml_prediction - actual_total) / max(actual_total, 1.0)
-        ml_weight = max(0.2, min(0.8, 0.8 - 0.5 * divergence_ratio))
-        logic_weight = 1.0 - ml_weight
-        final = ml_weight * ml_prediction + logic_weight * actual_total
-        return max(0.0, final)
+    def _compute_confidence(variance: float) -> float:
+        if variance < 0.2:
+            return 0.9
+        if variance < 0.5:
+            return 0.6
+        return 0.3
 
     @staticmethod
-    def _confidence_score(ml_prediction: float, actual_total: float, food: float, transport: float, shopping: float) -> float:
-        if actual_total <= 0:
-            agreement_score = 1.0
-        else:
-            ratio = abs(ml_prediction - actual_total) / max(actual_total, 1.0)
-            agreement_score = max(0.0, min(1.0, 1.0 / (1.0 + ratio)))
-
-        values = [food, transport, shopping]
-        mean_value = sum(values) / len(values)
-        if mean_value <= 0:
-            stability_score = 1.0
-        else:
-            variance = sum((v - mean_value) ** 2 for v in values) / len(values)
-            std_dev = variance ** 0.5
-            coeff_var = std_dev / mean_value
-            stability_score = max(0.0, min(1.0, 1.0 / (1.0 + coeff_var)))
-
-        score = 0.7 * agreement_score + 0.3 * stability_score
-        return max(0.0, min(1.0, score))
-
-    @staticmethod
-    def _confidence_label(score: float) -> str:
-        if score >= 0.8:
+    def _confidence_label(variance: float) -> str:
+        if variance < 0.2:
             return "high"
-        if score >= 0.6:
+        if variance < 0.5:
             return "medium"
         return "low"
 
     @staticmethod
     def _expense_status(predicted_expense: float, budget: float | None) -> str:
-        if budget is not None:
-            if budget <= 0:
-                return "High"
-            utilization = predicted_expense / budget
-            if utilization <= 0.8:
-                return "Low"
-            if utilization <= 1.0:
-                return "Moderate"
+        if budget is None:
+            return "Not Available"
+
+        if budget <= 0:
             return "High"
 
-        if predicted_expense <= 3000:
-            return "Low"
-        if predicted_expense <= 12000:
+        ratio = predicted_expense / budget
+        if ratio > 0.8:
+            return "High"
+        if ratio > 0.5:
             return "Moderate"
-        return "High"
+        return "Low"
 
     @staticmethod
-    def _suggestion(food: float, transport: float, shopping: float, budget: float | None, predicted_expense: float) -> str:
-        buckets = {
+    def _suggestion(food: float, transport: float, shopping: float) -> str:
+        categories = {
             "food": food,
             "transport": transport,
             "shopping": shopping,
         }
-        highest_category = max(buckets, key=buckets.get)
+        highest = max(categories, key=categories.get)
 
-        if budget is not None and budget > 0 and predicted_expense > budget:
-            if highest_category == "shopping":
-                return "Predicted spending exceeds budget. Reduce shopping expenses first."
-            if highest_category == "food":
-                return "Predicted spending exceeds budget. Control food expenses and meal planning."
-            return "Predicted spending exceeds budget. Optimize transport costs where possible."
-
-        if highest_category == "shopping":
-            return "Shopping is your largest expense component. Consider setting a shopping cap."
-        if highest_category == "food":
-            return "Food spending is dominant. Plan meals weekly to control costs."
-        return "Transport has a strong share. Consider optimizing commute and travel frequency."
+        if highest == "shopping":
+            return "Shopping is your highest expense. Try reducing non-essential purchases."
+        if highest == "food":
+            return "Food is your highest expense. Consider meal planning to save more."
+        return "Transport is your highest expense. Look for commute optimization opportunities."
 
     @staticmethod
-    def _breakdown(food: float, transport: float, shopping: float, total: float) -> dict[str, float]:
+    def _breakdown(food: float, transport: float, shopping: float) -> dict[str, float]:
+        total = food + transport + shopping
         if total <= 0:
             return {
-                "food_percent": 0.0,
-                "transport_percent": 0.0,
-                "shopping_percent": 0.0,
+                "food": 0.0,
+                "transport": 0.0,
+                "shopping": 0.0,
             }
 
         return {
-            "food_percent": round((food / total) * 100.0, 2),
-            "transport_percent": round((transport / total) * 100.0, 2),
-            "shopping_percent": round((shopping / total) * 100.0, 2),
+            "food": round((food / total) * 100.0, 2),
+            "transport": round((transport / total) * 100.0, 2),
+            "shopping": round((shopping / total) * 100.0, 2),
         }
 
 
@@ -270,8 +243,6 @@ def health() -> Any:
             "model_loaded": state.model is not None,
             "model_file": state.model_path.name if state.model_path else None,
             "features": state.metadata.get("features", FEATURES),
-            "model_name": state.metadata.get("model_name") if isinstance(state.metadata, dict) else None,
-            "load_error": state.load_error,
         }
     )
 
